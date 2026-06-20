@@ -50,7 +50,13 @@ def extract_plate_text(image_bytes: bytes) -> str:
             files={"file": ("plate.jpg", image_bytes, "image/jpeg")},
             data={
                 "apikey": OCR_SPACE_API_KEY,
-                "OCREngine": "2",          # better for short, noisy text
+                "OCREngine": "3",          # Engine 3 -- highest accuracy,
+                                            # worth the extra processing time
+                                            # for short plate text. Has its
+                                            # own separate free quota (2,500/mo)
+                                            # from Engine 1/2's 25,000/mo, so
+                                            # switching doesn't use up your
+                                            # main quota faster.
                 "scale": "true",
                 "detectOrientation": "true",
             },
@@ -159,8 +165,7 @@ def get_last_photo():
 #   "plate": "ACP1234",
 #   "status": "PAID",
 #   "owner": "T. Moyo",
-#   "amountPaid": "450.00",
-#   "expiryDate": "02/06/2027"
+#   "amountPaid": "450.00"
 # }
 #
 # If the plate can't be read or isn't found, status will be
@@ -176,14 +181,12 @@ def build_response(plate_id: str, data: dict | None) -> dict:
             "status": "NOTPAID",
             "owner": "",
             "amountPaid": "",
-            "expiryDate": "",
         }
     return {
         "plate": data.get("plate", plate_id),
         "status": data.get("status", "NOTPAID"),
         "owner": data.get("owner", ""),
         "amountPaid": data.get("amountPaid", ""),
-        "expiryDate": data.get("expiryDate", ""),
     }
 
 
