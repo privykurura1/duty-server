@@ -168,13 +168,33 @@ def get_last_photo():
 #   "amountPaid": "450.00"
 # }
 #
-# If the plate can't be read or isn't found, status will be
-# "NOTPAID" and the other fields will be empty strings -- the
-# ESP32 code is written to handle that gracefully.
+# "status" can be one of THREE things:
+#   "PAID"      -- plate was read and found, duty is paid
+#   "NOTPAID"   -- plate was read, but not found, or found
+#                  and marked unpaid
+#   "NOVEHICLE" -- OCR found NO readable plate text at all in
+#                  the photo. This usually means there genuinely
+#                  was no vehicle in frame (just background,
+#                  ground, etc), or the photo was too blurry/
+#                  dark to read anything at all. The ESP32 code
+#                  shows a distinct "no vehicle detected" screen
+#                  for this case, instead of treating it like an
+#                  actual unpaid vehicle.
 # -----------------------------------------------------------
-def build_response(plate_id: str, data: dict | None) -> dict:
-    """Builds the JSON shape sent back to the ESP32-CAM, whether
-    or not a matching record was found."""
+def build_response(plate_id: str, data: dict | None, no_vehicle: bool = False) -> dict:
+    """Builds the JSON shape sent back to the ESP32-CAM.
+
+    no_vehicle=True means OCR found no plate text at all --
+    this is reported as its own status, separate from a real
+    "not paid" result, since they mean very different things.
+    """
+    if no_vehicle:
+        return {
+            "plate": "",
+            "status": "NOVEHICLE",
+            "owner": "",
+            "amountPaid": "",
+        }
     if data is None:
         return {
             "plate": plate_id,
@@ -198,7 +218,8 @@ async def check_duty(request: Request):
     image_bytes = await request.body()
 
     if not image_bytes:
-        return build_response("", None)
+        # No photo data at all was sent -- nothing to check
+        return build_response("", None, no_vehicle=True)
 
     # DEBUG: save the most recent photo received, so you can
     # open it and SEE exactly what the camera captured. This
@@ -216,8 +237,10 @@ async def check_duty(request: Request):
     print(f"OCR read plate as: '{plate_id}'")
 
     if not plate_id:
-        # Could not read anything usable from the photo
-        return build_response("", None)
+        # OCR found no readable plate text at all -- most likely
+        # no vehicle was actually in frame, or the photo was too
+        # blurry/dark. Report this as its own distinct status.
+        return build_response("", None, no_vehicle=True)
 
     # Step 2: look that plate up in Firestore
     doc_ref = db.collection("vehicles").document(plate_id)
