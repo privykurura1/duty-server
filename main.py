@@ -110,24 +110,30 @@ def _ocr_attempt(image_bytes: bytes) -> str:
         if not stripped or any(marker in stripped for marker in no_text_markers):
             return ""
 
-        # Look for a plate-like pattern: 2-3 letters + 1-4 digits
-        # (adjust this pattern later to match real ZIMRA plate formats)
-        match = re.search(r"[A-Z]{2,3}[\s-]?\d{2,4}", raw_text)
+        # Zimbabwean plates print the word "ZIMBABWE" near the
+        # coat of arms -- OCR sometimes reads this too and glues
+        # it onto the plate text (e.g. "6793PZIMBABWE"). Strip it
+        # out BEFORE pattern matching, so it can't contaminate
+        # the result.
+        text_for_matching = re.sub(r"ZIMBABWE", " ", raw_text)
+
+        # Real Zimbabwean plates (since 2006) are an EXACT format:
+        # 3 letters, then 4 digits (e.g. "ABC 1234"). Matching this
+        # precisely -- not "2-3 letters + 1-4 digits" -- is what
+        # actually filters out garbled OCR fragments like "679AGP"
+        # or "9AGP4", which technically contain letters and digits
+        # but aren't a real 3-letter+4-digit plate at all.
+        match = re.search(r"\b[A-Z]{3}[\s-]?\d{4}\b", text_for_matching)
         if match:
-            return match.group(0).replace(" ", "").replace("-", "")
+            candidate = match.group(0).replace(" ", "").replace("-", "")
+            return candidate
 
-        # Fallback: strip everything except letters/numbers and
-        # return it as-is if OCR found anything at all
-        cleaned = re.sub(r"[^A-Z0-9]", "", raw_text)
-
-        # If that cleanup produced an unreasonably long string of
-        # letters with no digits at all, it's almost certainly
-        # stray text/background noise, not a plate -- a real
-        # plate always has at least one digit.
-        if not re.search(r"\d", cleaned):
-            return ""
-
-        return cleaned
+        # Nothing matched the exact real plate format -- whatever
+        # OCR saw isn't a genuine, fully-readable plate. Rather
+        # than guessing from a loose fallback cleanup (which is
+        # what let scrambled fragments through before), report
+        # this as unreadable.
+        return ""
 
     except Exception as e:
         print(f"OCR error: {e}")
