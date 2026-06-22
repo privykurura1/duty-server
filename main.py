@@ -39,48 +39,30 @@ OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY", "helloworld")
 OCR_SPACE_URL = "https://api.ocr.space/parse/image"
 
 # -----------------------------------------------------------
-# CAMERA ORIENTATION FIX
+# CAMERA ORIENTATION -- handled automatically
 # -----------------------------------------------------------
-# The ESP32-CAM module is physically mounted upside-down in
-# this build, so every photo it takes comes out rotated 180
-# degrees. Rather than requiring a physical remount, this
-# rotates the image back to right-side-up here on the server,
-# before OCR ever sees it.
+# Earlier versions of this file manually rotated images 180
+# degrees here on the server, based on a fixed assumption
+# about how the camera was mounted. That approach broke every
+# time the camera's physical position changed between tests.
 #
-# If you DO physically remount the camera the right way up
-# later, simply change this to False to stop rotating.
+# OCR.space's own "detectOrientation" option (enabled below,
+# in the API call itself) already looks at the actual text in
+# each photo and corrects its orientation automatically, photo
+# by photo -- regardless of how the camera happened to be
+# positioned when that specific photo was taken. This is more
+# reliable than guessing a single fixed rotation, so manual
+# rotation has been removed entirely.
 # -----------------------------------------------------------
-# CONFIRMED via the debug photo viewer: the camera IS currently
-# capturing the plate upside-down (the physical plate on the
-# real vehicle is mounted normally -- confirmed by checking the
-# actual car). Rotation re-enabled to correct this before OCR.
-CAMERA_IS_UPSIDE_DOWN = True
 
 
-def fix_image_orientation(image_bytes: bytes) -> bytes:
-    """Rotates the photo 180 degrees if the camera is mounted
-    upside-down. Returns the original bytes unchanged if
-    CAMERA_IS_UPSIDE_DOWN is False, or if rotation fails for
-    any reason (so a rotation bug never blocks the whole scan)."""
-    if not CAMERA_IS_UPSIDE_DOWN:
-        return image_bytes
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        rotated = img.rotate(180, expand=True)
-        output = io.BytesIO()
-        rotated.save(output, format="JPEG")
-        return output.getvalue()
-    except Exception as e:
-        print(f"Could not rotate image, using original: {e}")
-        return image_bytes
-
-
-def extract_plate_text(image_bytes: bytes) -> str:
+def _ocr_attempt(image_bytes: bytes) -> str:
     """
-    Sends the photo to OCR.space, gets back whatever text it
-    can read, then picks out something that looks like a
-    Zimbabwean-style plate (letters followed by numbers).
-    Returns an empty string if nothing usable was found.
+    Sends ONE version of the photo to OCR.space and returns
+    whatever plate-like text it can find, or "" if nothing
+    usable came back. This is the single-attempt building
+    block -- extract_plate_text() below calls this twice
+    (original, then rotated) if needed.
     """
     try:
         response = requests.post(
@@ -105,6 +87,12 @@ def extract_plate_text(image_bytes: bytes) -> str:
         parsed_results = result.get("ParsedResults", [])
         if not parsed_results:
             return ""
+
+        # Log what OCR.space's own orientation detection reported,
+        # so we can see whether it's actually catching upside-down
+        # plates or not, rather than guessing.
+        text_orientation = parsed_results[0].get("TextOrientation", "unknown")
+        print(f"OCR detected text orientation: {text_orientation} degrees")
 
         raw_text = parsed_results[0].get("ParsedText", "")
         raw_text = raw_text.upper().replace("\n", " ").replace("\r", " ")
@@ -144,6 +132,38 @@ def extract_plate_text(image_bytes: bytes) -> str:
     except Exception as e:
         print(f"OCR error: {e}")
         return ""
+
+
+def extract_plate_text(image_bytes: bytes) -> str:
+    """
+    Tries to read a plate from the photo. OCR.space's own
+    "detectOrientation" setting usually corrects upside-down
+    text on its own, but real testing showed it doesn't always
+    catch plate-style fonts reliably. As a backup, if the first
+    attempt finds nothing usable, this automatically retries
+    with the image rotated 180 degrees -- so it works whether
+    the camera happens to be right-side-up or upside-down at
+    any given moment, with no fixed assumption either way.
+    """
+    first_try = _ocr_attempt(image_bytes)
+    if first_try:
+        return first_try
+
+    print("First OCR attempt found nothing usable -- retrying with image rotated 180 degrees...")
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        rotated = img.rotate(180, expand=True)
+        output = io.BytesIO()
+        rotated.save(output, format="JPEG")
+        rotated_bytes = output.getvalue()
+    except Exception as e:
+        print(f"Could not rotate image for retry: {e}")
+        return ""
+
+    second_try = _ocr_attempt(rotated_bytes)
+    if second_try:
+        print("Rotated retry succeeded.")
+    return second_try
 
 # -----------------------------------------------------------
 # FIREBASE SETUP
@@ -279,11 +299,6 @@ async def check_duty(request: Request):
     if not image_bytes:
         # No photo data at all was sent -- nothing to check
         return build_response("", None, no_vehicle=True)
-
-    # Correct the camera's upside-down mounting before anything
-    # else touches this image -- both the debug photo viewer and
-    # OCR should see it right-side-up.
-    image_bytes = fix_image_orientation(image_bytes)
 
     # DEBUG: save the most recent photo received, so you can
     # open it and SEE exactly what the camera captured. This
