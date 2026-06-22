@@ -71,6 +71,19 @@ def extract_plate_text(image_bytes: bytes) -> str:
         raw_text = parsed_results[0].get("ParsedText", "")
         raw_text = raw_text.upper().replace("\n", " ").replace("\r", " ")
 
+        # OCR.space sometimes returns a literal message like
+        # "No text detected." as the ParsedText itself, when it
+        # processed the image fine but found nothing readable.
+        # Catch this explicitly -- otherwise the fallback below
+        # would mangle that message into something that LOOKS
+        # like a real plate (e.g. "NOTEXTDETECTED"), which is
+        # wrong: it means no vehicle/plate was actually visible,
+        # not that a plate was found.
+        no_text_markers = ["NO TEXT DETECTED", "NOTEXTDETECTED"]
+        stripped = raw_text.strip().rstrip(".!")
+        if not stripped or any(marker in stripped for marker in no_text_markers):
+            return ""
+
         # Look for a plate-like pattern: 2-3 letters + 1-4 digits
         # (adjust this pattern later to match real ZIMRA plate formats)
         match = re.search(r"[A-Z]{2,3}[\s-]?\d{2,4}", raw_text)
@@ -80,6 +93,14 @@ def extract_plate_text(image_bytes: bytes) -> str:
         # Fallback: strip everything except letters/numbers and
         # return it as-is if OCR found anything at all
         cleaned = re.sub(r"[^A-Z0-9]", "", raw_text)
+
+        # If that cleanup produced an unreasonably long string of
+        # letters with no digits at all, it's almost certainly
+        # stray text/background noise, not a plate -- a real
+        # plate always has at least one digit.
+        if not re.search(r"\d", cleaned):
+            return ""
+
         return cleaned
 
     except Exception as e:
