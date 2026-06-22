@@ -50,11 +50,11 @@ OCR_SPACE_URL = "https://api.ocr.space/parse/image"
 # If you DO physically remount the camera the right way up
 # later, simply change this to False to stop rotating.
 # -----------------------------------------------------------
-# CONFIRMED via the debug photo viewer: the camera was already
-# capturing images right-side-up. The earlier garbled OCR
-# result ("RP2VEL" instead of "AET4645") was NOT caused by
-# orientation -- turned OFF to avoid making things worse.
-CAMERA_IS_UPSIDE_DOWN = False
+# CONFIRMED via the debug photo viewer: the camera IS currently
+# capturing the plate upside-down (the physical plate on the
+# real vehicle is mounted normally -- confirmed by checking the
+# actual car). Rotation re-enabled to correct this before OCR.
+CAMERA_IS_UPSIDE_DOWN = True
 
 
 def fix_image_orientation(image_bytes: bytes) -> bytes:
