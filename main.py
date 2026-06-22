@@ -23,6 +23,8 @@ import os
 import json
 import re
 import requests
+from PIL import Image
+import io
 
 app = FastAPI()
 
@@ -35,6 +37,42 @@ app = FastAPI()
 # -----------------------------------------------------------
 OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY", "helloworld")
 OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+
+# -----------------------------------------------------------
+# CAMERA ORIENTATION FIX
+# -----------------------------------------------------------
+# The ESP32-CAM module is physically mounted upside-down in
+# this build, so every photo it takes comes out rotated 180
+# degrees. Rather than requiring a physical remount, this
+# rotates the image back to right-side-up here on the server,
+# before OCR ever sees it.
+#
+# If you DO physically remount the camera the right way up
+# later, simply change this to False to stop rotating.
+# -----------------------------------------------------------
+# CONFIRMED via the debug photo viewer: the camera was already
+# capturing images right-side-up. The earlier garbled OCR
+# result ("RP2VEL" instead of "AET4645") was NOT caused by
+# orientation -- turned OFF to avoid making things worse.
+CAMERA_IS_UPSIDE_DOWN = False
+
+
+def fix_image_orientation(image_bytes: bytes) -> bytes:
+    """Rotates the photo 180 degrees if the camera is mounted
+    upside-down. Returns the original bytes unchanged if
+    CAMERA_IS_UPSIDE_DOWN is False, or if rotation fails for
+    any reason (so a rotation bug never blocks the whole scan)."""
+    if not CAMERA_IS_UPSIDE_DOWN:
+        return image_bytes
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        rotated = img.rotate(180, expand=True)
+        output = io.BytesIO()
+        rotated.save(output, format="JPEG")
+        return output.getvalue()
+    except Exception as e:
+        print(f"Could not rotate image, using original: {e}")
+        return image_bytes
 
 
 def extract_plate_text(image_bytes: bytes) -> str:
@@ -241,6 +279,11 @@ async def check_duty(request: Request):
     if not image_bytes:
         # No photo data at all was sent -- nothing to check
         return build_response("", None, no_vehicle=True)
+
+    # Correct the camera's upside-down mounting before anything
+    # else touches this image -- both the debug photo viewer and
+    # OCR should see it right-side-up.
+    image_bytes = fix_image_orientation(image_bytes)
 
     # DEBUG: save the most recent photo received, so you can
     # open it and SEE exactly what the camera captured. This
