@@ -84,8 +84,20 @@ def _ocr_attempt(image_bytes: bytes) -> str:
         )
         result = response.json()
 
+        # Check explicitly for errors OCR.space reports itself --
+        # this includes rate limiting, quota exceeded, or bad
+        # requests. Without this check, an error response could
+        # silently look identical to "no text found", making a
+        # rate-limit problem indistinguishable from a genuinely
+        # blank photo.
+        if result.get("IsErroredOnProcessing"):
+            error_msg = result.get("ErrorMessage", ["Unknown OCR error"])
+            print(f"OCR.space reported an error: {error_msg}")
+            return ""
+
         parsed_results = result.get("ParsedResults", [])
         if not parsed_results:
+            print(f"OCR.space returned no ParsedResults at all. Full response: {result}")
             return ""
 
         # Log what OCR.space's own orientation detection reported,
@@ -128,11 +140,28 @@ def _ocr_attempt(image_bytes: bytes) -> str:
             candidate = match.group(0).replace(" ", "").replace("-", "")
             return candidate
 
-        # Nothing matched the exact real plate format -- whatever
-        # OCR saw isn't a genuine, fully-readable plate. Rather
-        # than guessing from a loose fallback cleanup (which is
-        # what let scrambled fragments through before), report
-        # this as unreadable.
+        # SECOND PASS: OCR frequently confuses the digit 0 with the
+        # letter O, and occasionally 1 with I, in bold plate fonts
+        # -- a real plate like "AHP 0051" can come back as
+        # "AHP O051" and fail the strict digit-only match above
+        # even though it's a perfectly genuine, clearly readable
+        # plate. Try again allowing those specific look-alikes in
+        # the digit positions only, so a single ambiguous character
+        # doesn't throw away an otherwise-correct read.
+        tolerant_match = re.search(r"\b[A-Z]{3}[\s-]?[0-9OIoi]{4}\b", text_for_matching)
+        if tolerant_match:
+            candidate = tolerant_match.group(0).replace(" ", "").replace("-", "")
+            # Normalize the digit section back to real digits now
+            # that we've found a plate-shaped candidate.
+            letters, digits = candidate[:3], candidate[3:]
+            digits = digits.replace("O", "0").replace("o", "0").replace("I", "1").replace("i", "1")
+            return letters + digits
+
+        # Nothing matched the real plate format, even with tolerance
+        # for common look-alike characters -- whatever OCR saw isn't
+        # a genuine, fully-readable plate. Rather than guessing from
+        # a loose fallback cleanup (which is what let scrambled
+        # fragments through before), report this as unreadable.
         return ""
 
     except Exception as e:
