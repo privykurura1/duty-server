@@ -24,6 +24,7 @@ import json
 import re
 import requests
 from PIL import Image
+from itertools import product
 import io
 
 app = FastAPI()
@@ -200,6 +201,81 @@ def extract_plate_text(image_bytes: bytes) -> str:
         print("Rotated retry succeeded.")
     return second_try
 
+
+# -----------------------------------------------------------
+# O / Q LETTER-CONFUSION FALLBACK
+# -----------------------------------------------------------
+# "O" and "Q" are both real, valid letters in Zimbabwean plates
+# (e.g. AGQ4213 is a genuine registered plate), so this can't be
+# fixed the way the O/0 digit confusion is fixed above -- there's
+# no single "correct" character to normalize to. OCR just
+# occasionally guesses the wrong one of the two in certain fonts
+# or photo angles.
+#
+# Instead of guessing at OCR time, this is resolved at LOOKUP
+# time: if the plate exactly as OCR read it isn't in Firestore,
+# try swapping O<->Q in the letter section and see if THAT
+# version is registered instead. Real plates with multiple O/Q
+# letters get every combination tried, not just a single swap.
+# -----------------------------------------------------------
+
+def _generate_oq_variants(plate_id: str) -> list[str]:
+    """
+    Builds alternate plate IDs with O <-> Q swapped in the
+    LETTER section only (the first 3 characters) -- never in the
+    digit section, since Q/O aren't digit look-alikes. Returns
+    every combination other than the original, in no particular
+    order; callers should stop at the first one that's actually
+    registered in Firestore.
+    """
+    if len(plate_id) < 4:
+        return []
+
+    letters = list(plate_id[:3])
+    rest = plate_id[3:]
+
+    ambiguous_positions = [i for i, ch in enumerate(letters) if ch in ("O", "Q")]
+    if not ambiguous_positions:
+        return []
+
+    swap = {"O": "Q", "Q": "O"}
+    variants = set()
+    for combo in product([0, 1], repeat=len(ambiguous_positions)):
+        candidate = letters.copy()
+        for flip, pos in zip(combo, ambiguous_positions):
+            if flip:
+                candidate[pos] = swap[candidate[pos]]
+        variant = "".join(candidate) + rest
+        if variant != plate_id:
+            variants.add(variant)
+
+    return list(variants)
+
+
+def lookup_vehicle(plate_id: str):
+    """
+    Looks up a plate in Firestore. If the exact OCR'd plate isn't
+    found, retries with O/Q swapped in the letter section before
+    giving up -- see _generate_oq_variants() above for why.
+
+    Returns (resolved_plate_id, data_dict_or_None). resolved_plate_id
+    is whichever version actually matched (original or swapped), so
+    the response always reflects the plate as it's really registered,
+    not necessarily exactly what OCR first guessed.
+    """
+    doc = db.collection("vehicles").document(plate_id).get()
+    if doc.exists:
+        return plate_id, doc.to_dict()
+
+    for variant in _generate_oq_variants(plate_id):
+        variant_doc = db.collection("vehicles").document(variant).get()
+        if variant_doc.exists:
+            print(f"Plate '{plate_id}' not found directly -- O/Q-swapped variant '{variant}' matched instead.")
+            return variant, variant_doc.to_dict()
+
+    return plate_id, None
+
+
 # -----------------------------------------------------------
 # FIREBASE SETUP
 # -----------------------------------------------------------
@@ -279,7 +355,11 @@ def get_last_photo():
 #   "plate": "ACP1234",
 #   "status": "PAID",
 #   "owner": "T. Moyo",
-#   "amountPaid": "450.00"
+#   "amountPaid": "450.00",
+#   "clearanceStatus": "CLEARED",
+#   "officerName": "Tendai",
+#   "officerSurname": "Moyo",
+#   "forceNumber": "ZRP4521"
 # }
 #
 # "status" can be one of THREE things:
@@ -294,6 +374,14 @@ def get_last_photo():
 #                  shows a distinct "no vehicle detected" screen
 #                  for this case, instead of treating it like an
 #                  actual unpaid vehicle.
+#
+# "clearanceStatus" mirrors the same field from the admin
+# register ("CLEARED" / "NOTCLEARED"), and officerName /
+# officerSurname / forceNumber identify whoever last cleared
+# the vehicle, if anyone has. The clearance photo itself is
+# deliberately left out of this response -- it's a multi-
+# hundred-KB base64 string, which is a lot to push to an
+# ESP32-CAM that has nowhere to display it anyway.
 # -----------------------------------------------------------
 def build_response(plate_id: str, data: dict | None, no_vehicle: bool = False) -> dict:
     """Builds the JSON shape sent back to the ESP32-CAM.
@@ -308,6 +396,10 @@ def build_response(plate_id: str, data: dict | None, no_vehicle: bool = False) -
             "status": "NOVEHICLE",
             "owner": "",
             "amountPaid": "",
+            "clearanceStatus": "",
+            "officerName": "",
+            "officerSurname": "",
+            "forceNumber": "",
         }
     if data is None:
         return {
@@ -315,12 +407,20 @@ def build_response(plate_id: str, data: dict | None, no_vehicle: bool = False) -
             "status": "NOTPAID",
             "owner": "",
             "amountPaid": "",
+            "clearanceStatus": "NOTCLEARED",
+            "officerName": "",
+            "officerSurname": "",
+            "forceNumber": "",
         }
     return {
         "plate": data.get("plate", plate_id),
         "status": data.get("status", "NOTPAID"),
         "owner": data.get("owner", ""),
         "amountPaid": data.get("amountPaid", ""),
+        "clearanceStatus": data.get("clearanceStatus", "NOTCLEARED"),
+        "officerName": data.get("officerName", ""),
+        "officerSurname": data.get("officerSurname", ""),
+        "forceNumber": data.get("forceNumber", ""),
     }
 
 
@@ -356,16 +456,10 @@ async def check_duty(request: Request):
         # blurry/dark. Report this as its own distinct status.
         return build_response("", None, no_vehicle=True)
 
-    # Step 2: look that plate up in Firestore
-    doc_ref = db.collection("vehicles").document(plate_id)
-    doc = doc_ref.get()
-
-    if doc.exists:
-        return build_response(plate_id, doc.to_dict())
-    else:
-        # Plate not found in database -- treat as not paid,
-        # since we have no record of payment
-        return build_response(plate_id, None)
+    # Step 2: look that plate up in Firestore, with an O/Q
+    # letter-swap retry if the first guess isn't registered
+    resolved_plate_id, data = lookup_vehicle(plate_id)
+    return build_response(resolved_plate_id, data)
 
 
 # -----------------------------------------------------------
@@ -379,10 +473,5 @@ async def check_duty_test(plate: str):
         return build_response(plate, None)
 
     plate_id = plate.strip().upper().replace(" ", "")
-    doc_ref = db.collection("vehicles").document(plate_id)
-    doc = doc_ref.get()
-
-    if doc.exists:
-        return build_response(plate_id, doc.to_dict())
-    else:
-        return build_response(plate_id, None)
+    resolved_plate_id, data = lookup_vehicle(plate_id)
+    return build_response(resolved_plate_id, data)
