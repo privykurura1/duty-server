@@ -1,477 +1,545 @@
-# ===========================================================
-# ZIMRA Duty Check -- Lookup Server
-# MPKComteck Technology Solutions
-# ===========================================================
+# main.py
+# Fambai CV — Job Scan (pure logic, no AI/API key required)
+# v2: adds URL/company verification — detects domain impersonation, typosquatting,
+# suspicious TLDs, and newly-registered domains, on top of the existing
+# scam-phrase rules engine.
 #
-# WHAT THIS SERVER DOES:
-# The ESP32-CAM sends a number plate (as plain text) to this
-# server. This server looks up that plate in Firestore and
-# replies with either "PAID" or "NOTPAID" as plain text.
+# Run locally:
+#   pip install -r requirements.txt
+#   uvicorn main:app --reload --host 0.0.0.0 --port 8000
 #
-# This runs on Render.com's free tier -- NOT on Firebase --
-# because Firebase Hosting alone cannot run server-side code
-# without the paid Blaze plan. This server still reads and
-# writes to your Firestore database, which IS free.
+# Test:
+#   Open http://localhost:8000/docs
 #
-# ===========================================================
+# Deploy (Render.com):
+#   Start command -> uvicorn main:app --host 0.0.0.0 --port $PORT
 
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
-import firebase_admin
-from firebase_admin import credentials, firestore
-import os
+import difflib
 import json
 import re
+from datetime import datetime
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse
+
 import requests
-from PIL import Image
-from itertools import product
-import io
+from bs4 import BeautifulSoup
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-app = FastAPI()
+# WHOIS is optional — if the package isn't installed or the lookup fails
+# (some registries block/rate-limit it), domain-age checking is just skipped
+# rather than crashing the request.
+try:
+    import whois as whois_lib
+    WHOIS_AVAILABLE = True
+except ImportError:
+    WHOIS_AVAILABLE = False
 
-# -----------------------------------------------------------
-# OCR.SPACE SETUP -- reads the plate text out of the photo
-# -----------------------------------------------------------
-# Get a free key at: https://ocr.space/ocrapi/freekey
-# On Render.com, set this as an environment variable called
-# OCR_SPACE_API_KEY
-# -----------------------------------------------------------
-OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY", "helloworld")
-OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+app = FastAPI(title="Fambai CV — Job Scan")
 
-# -----------------------------------------------------------
-# CAMERA ORIENTATION -- handled automatically
-# -----------------------------------------------------------
-# Earlier versions of this file manually rotated images 180
-# degrees here on the server, based on a fixed assumption
-# about how the camera was mounted. That approach broke every
-# time the camera's physical position changed between tests.
-#
-# OCR.space's own "detectOrientation" option (enabled below,
-# in the API call itself) already looks at the actual text in
-# each photo and corrects its orientation automatically, photo
-# by photo -- regardless of how the camera happened to be
-# positioned when that specific photo was taken. This is more
-# reliable than guessing a single fixed rotation, so manual
-# rotation has been removed entirely.
-# -----------------------------------------------------------
+URL_PATTERN = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 
-def _ocr_attempt(image_bytes: bytes) -> str:
-    """
-    Sends ONE version of the photo to OCR.space and returns
-    whatever plate-like text it can find, or "" if nothing
-    usable came back. This is the single-attempt building
-    block -- extract_plate_text() below calls this twice
-    (original, then rotated) if needed.
-    """
+# ---------- Request / Response models ----------
+
+class JobScanRequest(BaseModel):
+    input: str  # either a URL or pasted job ad text
+
+
+class JobScanResponse(BaseModel):
+    score: int
+    label: str
+    warnings: List[str]
+    source_type: str  # "url" or "text"
+    fetch_failed: bool = False
+    domain: Optional[str] = None
+    detected_company: Optional[str] = None
+    confidence: str = "medium"  # "low" / "medium" / "high" — how much signal we had to work with
+    disclaimer: str = (
+        "This is an automated check based on common scam patterns. It can miss real "
+        "scams and can occasionally flag a genuine job ad incorrectly. Always verify "
+        "independently and never pay money to apply for, secure, or start a job."
+    )
+
+
+# ---------- Fetching ----------
+
+def fetch_page(url: str) -> Optional[Tuple[BeautifulSoup, str, int]]:
+    """Best-effort fetch of a job posting URL. Follows redirects (so
+    shortened links like bit.ly/tinyurl resolve to their real destination)
+    and returns (soup, final_url, redirect_count), or None on failure
+    (blocked, timeout, login wall, etc.)."""
     try:
-        response = requests.post(
-            OCR_SPACE_URL,
-            files={"file": ("plate.jpg", image_bytes, "image/jpeg")},
-            data={
-                "apikey": OCR_SPACE_API_KEY,
-                "OCREngine": "3",          # Engine 3 -- highest accuracy,
-                                            # worth the extra processing time
-                                            # for short plate text. Has its
-                                            # own separate free quota (2,500/mo)
-                                            # from Engine 1/2's 25,000/mo, so
-                                            # switching doesn't use up your
-                                            # main quota faster.
-                "scale": "true",
-                "detectOrientation": "true",
-            },
-            timeout=20,
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; FambaiCV-JobScan/1.0)"},
+            timeout=8,
+            allow_redirects=True,
         )
-        result = response.json()
-
-        # Check explicitly for errors OCR.space reports itself --
-        # this includes rate limiting, quota exceeded, or bad
-        # requests. Without this check, an error response could
-        # silently look identical to "no text found", making a
-        # rate-limit problem indistinguishable from a genuinely
-        # blank photo.
-        if result.get("IsErroredOnProcessing"):
-            error_msg = result.get("ErrorMessage", ["Unknown OCR error"])
-            print(f"OCR.space reported an error: {error_msg}")
-            return ""
-
-        parsed_results = result.get("ParsedResults", [])
-        if not parsed_results:
-            print(f"OCR.space returned no ParsedResults at all. Full response: {result}")
-            return ""
-
-        # Log what OCR.space's own orientation detection reported,
-        # so we can see whether it's actually catching upside-down
-        # plates or not, rather than guessing.
-        text_orientation = parsed_results[0].get("TextOrientation", "unknown")
-        print(f"OCR detected text orientation: {text_orientation} degrees")
-
-        raw_text = parsed_results[0].get("ParsedText", "")
-        raw_text = raw_text.upper().replace("\n", " ").replace("\r", " ")
-
-        # OCR.space sometimes returns a literal message like
-        # "No text detected." as the ParsedText itself, when it
-        # processed the image fine but found nothing readable.
-        # Catch this explicitly -- otherwise the fallback below
-        # would mangle that message into something that LOOKS
-        # like a real plate (e.g. "NOTEXTDETECTED"), which is
-        # wrong: it means no vehicle/plate was actually visible,
-        # not that a plate was found.
-        no_text_markers = ["NO TEXT DETECTED", "NOTEXTDETECTED"]
-        stripped = raw_text.strip().rstrip(".!")
-        if not stripped or any(marker in stripped for marker in no_text_markers):
-            return ""
-
-        # Zimbabwean plates print the word "ZIMBABWE" near the
-        # coat of arms -- OCR sometimes reads this too and glues
-        # it onto the plate text (e.g. "6793PZIMBABWE"). Strip it
-        # out BEFORE pattern matching, so it can't contaminate
-        # the result.
-        text_for_matching = re.sub(r"ZIMBABWE", " ", raw_text)
-
-        # Real Zimbabwean plates (since 2006) are an EXACT format:
-        # 3 letters, then 4 digits (e.g. "ABC 1234"). Matching this
-        # precisely -- not "2-3 letters + 1-4 digits" -- is what
-        # actually filters out garbled OCR fragments like "679AGP"
-        # or "9AGP4", which technically contain letters and digits
-        # but aren't a real 3-letter+4-digit plate at all.
-        match = re.search(r"\b[A-Z]{3}[\s-]?\d{4}\b", text_for_matching)
-        if match:
-            candidate = match.group(0).replace(" ", "").replace("-", "")
-            return candidate
-
-        # SECOND PASS: OCR frequently confuses the digit 0 with the
-        # letter O, and occasionally 1 with I, in bold plate fonts
-        # -- a real plate like "AHP 0051" can come back as
-        # "AHP O051" and fail the strict digit-only match above
-        # even though it's a perfectly genuine, clearly readable
-        # plate. Try again allowing those specific look-alikes in
-        # the digit positions only, so a single ambiguous character
-        # doesn't throw away an otherwise-correct read.
-        tolerant_match = re.search(r"\b[A-Z]{3}[\s-]?[0-9OIoi]{4}\b", text_for_matching)
-        if tolerant_match:
-            candidate = tolerant_match.group(0).replace(" ", "").replace("-", "")
-            # Normalize the digit section back to real digits now
-            # that we've found a plate-shaped candidate.
-            letters, digits = candidate[:3], candidate[3:]
-            digits = digits.replace("O", "0").replace("o", "0").replace("I", "1").replace("i", "1")
-            return letters + digits
-
-        # Nothing matched the real plate format, even with tolerance
-        # for common look-alike characters -- whatever OCR saw isn't
-        # a genuine, fully-readable plate. Rather than guessing from
-        # a loose fallback cleanup (which is what let scrambled
-        # fragments through before), report this as unreadable.
-        return ""
-
-    except Exception as e:
-        print(f"OCR error: {e}")
-        return ""
+        if resp.status_code != 200 or "text/html" not in resp.headers.get("Content-Type", ""):
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        return soup, resp.url, len(resp.history)
+    except requests.RequestException:
+        return None
 
 
-def extract_plate_text(image_bytes: bytes) -> str:
+def extract_visible_text(soup: BeautifulSoup) -> str:
+    """Strips scripts/styles/nav/etc and returns plain visible text.
+    Call this AFTER extract_company_name(), since that function reads
+    <script type="application/ld+json"> tags that this strips out."""
+    # Work on a fresh copy so we don't disturb the original soup if the
+    # caller still needs it for other extraction.
+    soup_copy = BeautifulSoup(str(soup), "html.parser")
+    for tag in soup_copy(["script", "style", "nav", "footer", "header", "noscript"]):
+        tag.decompose()
+    text = soup_copy.get_text(separator=" ", strip=True)
+    return re.sub(r"\s+", " ", text)[:8000]
+
+
+def extract_domain(url: str) -> str:
+    netloc = urlparse(url).netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc.split(":")[0]  # strip port if present
+
+
+def extract_company_name(soup: BeautifulSoup) -> Optional[str]:
+    """Tries to identify which company a job ad claims to represent, in
+    order of reliability:
+      1. JobPosting structured data (schema.org JSON-LD) -> hiringOrganization.name
+      2. og:site_name meta tag (the site's actual declared brand)
+      3. <title> tag, trimmed at common separators
     """
-    Tries to read a plate from the photo. OCR.space's own
-    "detectOrientation" setting usually corrects upside-down
-    text on its own, but real testing showed it doesn't always
-    catch plate-style fonts reliably. As a backup, if the first
-    attempt finds nothing usable, this automatically retries
-    with the image rotated 180 degrees -- so it works whether
-    the camera happens to be right-side-up or upside-down at
-    any given moment, with no fixed assumption either way.
-    """
-    first_try = _ocr_attempt(image_bytes)
-    if first_try:
-        return first_try
+    # 1. JSON-LD JobPosting schema
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                org = item.get("hiringOrganization")
+                if isinstance(org, dict) and org.get("name"):
+                    return str(org["name"]).strip()
 
-    print("First OCR attempt found nothing usable -- retrying with image rotated 180 degrees...")
+    # 2. og:site_name
+    og = soup.find("meta", attrs={"property": "og:site_name"})
+    if og and og.get("content"):
+        return og["content"].strip()
+
+    # 3. <title>
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+        for sep in (" - ", " | ", " :: "):
+            if sep in title:
+                return title.split(sep)[0].strip()
+        return title if title else None
+
+    return None
+
+
+# ---------- Known company domains (non-exhaustive safety net) ----------
+# This is a heuristic seed list, NOT a complete verified-employer database.
+# It catches impersonation of well-known brands but will miss smaller or
+# newer legitimate employers, and won't catch impersonation of a brand
+# that isn't in this list. Expand this over time using real reports from
+# your "Report fake jobs" feature — that's the only way this improves.
+
+KNOWN_DOMAINS = {
+    "econet": "econet.co.zw",
+    "netone": "netone.co.zw",
+    "ecocash": "ecocash.co.zw",
+    "zimra": "zimra.co.zw",
+    "cbz": "cbz.co.zw",
+    "steward bank": "stewardbank.co.zw",
+    "nmb bank": "nmbz.co.zw",
+    "old mutual": "oldmutual.co.zw",
+    "delta corporation": "deltacorporation.com",
+    "vacancymail": "vacancymail.co.zw",
+    "zimbajob": "zimbajob.com",
+    "indeed": "indeed.com",
+    "linkedin": "linkedin.com",
+}
+
+SUSPICIOUS_TLDS = (".tk", ".ml", ".ga", ".cf", ".xyz", ".top", ".click", ".work", ".loan", ".win", ".buzz")
+
+
+def check_company_domain_mismatch(domain: str, claimed_company: Optional[str]) -> List[str]:
+    """If the page claims to represent a known brand but isn't hosted on
+    that brand's real domain, this is one of the strongest scam signals
+    available without a verified-employer database."""
+    if not claimed_company:
+        return []
+
+    claimed_lower = claimed_company.lower()
+    warnings = []
+
+    for brand, official_domain in KNOWN_DOMAINS.items():
+        if brand not in claimed_lower:
+            continue
+        if domain == official_domain or domain.endswith("." + official_domain):
+            continue  # matches the real domain — fine
+
+        similarity = difflib.SequenceMatcher(None, domain, official_domain).ratio()
+        brand_root = official_domain.split(".")[0]
+
+        if similarity > 0.55 or brand_root in domain:
+            warnings.append(
+                f'This page claims to represent "{claimed_company}" but is hosted on '
+                f'"{domain}" — not their official domain ({official_domain}). This is a '
+                f"common pattern in fake job postings that impersonate real companies."
+            )
+        else:
+            warnings.append(
+                f'This page claims to represent "{claimed_company}" but is not on their '
+                f"known official domain ({official_domain}). Verify independently before applying."
+            )
+        break  # one flag per brand match is enough
+
+    return warnings
+
+
+def check_suspicious_tld(domain: str) -> List[str]:
+    if domain.endswith(SUSPICIOUS_TLDS):
+        ext = domain.split(".")[-1]
+        return [
+            f'This site uses a ".{ext}" domain extension, commonly used for disposable '
+            f"or scam websites. Treat with extra caution."
+        ]
+    return []
+
+
+IP_DOMAIN_REGEX = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+
+
+def check_ip_as_domain(domain: str) -> List[str]:
+    """A job posting hosted directly on a raw IP address (no real domain
+    name at all) is a strong scam indicator — legitimate companies don't
+    do this."""
+    if IP_DOMAIN_REGEX.match(domain):
+        return [
+            "This link uses a raw IP address instead of a proper company website "
+            "domain. Legitimate employers do not host job postings this way — "
+            "this is a strong scam indicator."
+        ]
+    return []
+
+
+def check_redirect_chain(redirect_count: int) -> List[str]:
+    """Long redirect chains (e.g. a shortened link bouncing through several
+    intermediate pages) are sometimes used to disguise the real destination
+    or to evade simple link-checking tools."""
+    if redirect_count >= 3:
+        return [
+            f"This link redirected {redirect_count} times before reaching its final "
+            f"destination. Long redirect chains are sometimes used to hide where a "
+            f"link actually leads."
+        ]
+    return []
+
+
+def check_brand_lookalike_domain(domain: str) -> List[str]:
+    """Domain-structure check, independent of extracted company text. Catches
+    cases where the page doesn't explicitly state a company name anywhere
+    (no JobPosting schema, no og:site_name, generic <title>) but the domain
+    itself contains a known brand name without being that brand's real
+    domain — e.g. 'econet-careers-zw.tk' or 'netone.fake-jobs.com'."""
+    warnings = []
+    for brand, official_domain in KNOWN_DOMAINS.items():
+        brand_root = official_domain.split(".")[0]
+        if brand_root in domain and domain != official_domain and not domain.endswith("." + official_domain):
+            warnings.append(
+                f'This domain ("{domain}") contains "{brand_root}" but is not the official '
+                f"domain for {brand.title()} ({official_domain}). This pattern is often used "
+                f"to impersonate well-known companies."
+            )
+    return warnings
+
+
+def check_domain_age(domain: str) -> List[str]:
+    """Best-effort WHOIS lookup. Fails silently (no warning, no penalty) if
+    WHOIS is unavailable or the lookup is blocked — we never penalize a job
+    ad just because we couldn't check its domain age."""
+    if not WHOIS_AVAILABLE:
+        return []
     try:
-        img = Image.open(io.BytesIO(image_bytes))
-        rotated = img.rotate(180, expand=True)
-        output = io.BytesIO()
-        rotated.save(output, format="JPEG")
-        rotated_bytes = output.getvalue()
-    except Exception as e:
-        print(f"Could not rotate image for retry: {e}")
-        return ""
-
-    second_try = _ocr_attempt(rotated_bytes)
-    if second_try:
-        print("Rotated retry succeeded.")
-    return second_try
-
-
-# -----------------------------------------------------------
-# O / Q LETTER-CONFUSION FALLBACK
-# -----------------------------------------------------------
-# "O" and "Q" are both real, valid letters in Zimbabwean plates
-# (e.g. AGQ4213 is a genuine registered plate), so this can't be
-# fixed the way the O/0 digit confusion is fixed above -- there's
-# no single "correct" character to normalize to. OCR just
-# occasionally guesses the wrong one of the two in certain fonts
-# or photo angles.
-#
-# Instead of guessing at OCR time, this is resolved at LOOKUP
-# time: if the plate exactly as OCR read it isn't in Firestore,
-# try swapping O<->Q in the letter section and see if THAT
-# version is registered instead. Real plates with multiple O/Q
-# letters get every combination tried, not just a single swap.
-# -----------------------------------------------------------
-
-def _generate_oq_variants(plate_id: str) -> list[str]:
-    """
-    Builds alternate plate IDs with O <-> Q swapped in the
-    LETTER section only (the first 3 characters) -- never in the
-    digit section, since Q/O aren't digit look-alikes. Returns
-    every combination other than the original, in no particular
-    order; callers should stop at the first one that's actually
-    registered in Firestore.
-    """
-    if len(plate_id) < 4:
+        w = whois_lib.whois(domain)
+        creation = w.creation_date
+        if isinstance(creation, list):
+            creation = creation[0]
+        if not isinstance(creation, datetime):
+            return []
+        age_days = (datetime.utcnow() - creation).days
+        if age_days < 30:
+            return [
+                "This website's domain was registered less than a month ago. "
+                "Newly created domains are frequently used for scam job postings."
+            ]
+        if age_days < 90:
+            return [
+                "This website's domain is less than 3 months old. Be cautious, "
+                "especially if it claims to represent an established company."
+            ]
         return []
-
-    letters = list(plate_id[:3])
-    rest = plate_id[3:]
-
-    ambiguous_positions = [i for i, ch in enumerate(letters) if ch in ("O", "Q")]
-    if not ambiguous_positions:
-        return []
-
-    swap = {"O": "Q", "Q": "O"}
-    variants = set()
-    for combo in product([0, 1], repeat=len(ambiguous_positions)):
-        candidate = letters.copy()
-        for flip, pos in zip(combo, ambiguous_positions):
-            if flip:
-                candidate[pos] = swap[candidate[pos]]
-        variant = "".join(candidate) + rest
-        if variant != plate_id:
-            variants.add(variant)
-
-    return list(variants)
+    except Exception:
+        return []  # WHOIS lookup failed/blocked — don't penalize for this
 
 
-def lookup_vehicle(plate_id: str):
-    """
-    Looks up a plate in Firestore. If the exact OCR'd plate isn't
-    found, retries with O/Q swapped in the letter section before
-    giving up -- see _generate_oq_variants() above for why.
+# ---------- Scam phrase detection (unchanged from previous version) ----------
 
-    Returns (resolved_plate_id, data_dict_or_None). resolved_plate_id
-    is whichever version actually matched (original or swapped), so
-    the response always reflects the plate as it's really registered,
-    not necessarily exactly what OCR first guessed.
-    """
-    doc = db.collection("vehicles").document(plate_id).get()
-    if doc.exists:
-        return plate_id, doc.to_dict()
+PAYMENT_SCAM_PHRASES = [
+    "registration fee", "training fee", "processing fee", "application fee",
+    "send ecocash", "send your ecocash", "send mobile money", "send money to",
+    "pay before", "pay a fee", "pay to secure", "deposit required",
+    "pay for uniform", "pay for training kit", "visa sponsorship fee",
+    "agent fee", "pay registration", "kindly pay", "fee is required",
+    "send $", "send your payment", "courier fee", "shipping fee",
+    "western union", "moneygram", "joining fee", "registration code",
+    "send your bank details", "send your account number", "clearance fee",
+]
 
-    for variant in _generate_oq_variants(plate_id):
-        variant_doc = db.collection("vehicles").document(variant).get()
-        if variant_doc.exists:
-            print(f"Plate '{plate_id}' not found directly -- O/Q-swapped variant '{variant}' matched instead.")
-            return variant, variant_doc.to_dict()
+PROMISE_SCAM_PHRASES = [
+    "guaranteed job", "guaranteed employment", "guaranteed income",
+    "no interview required", "no experience needed earn", "earn from home easily",
+    "100% guaranteed", "instant hiring", "hired immediately", "no cv needed",
+]
 
-    return plate_id, None
+URGENCY_PHRASES = [
+    "hurry", "limited slots", "act now", "act fast", "immediate start",
+    "only a few positions left", "apply within 24 hours", "today only",
+]
 
+VAGUE_CONTACT_PHRASES = [
+    "whatsapp only", "send your cv to this number", "contact us on whatsapp",
+    "dm to apply", "inbox us",
+]
 
-# -----------------------------------------------------------
-# FIREBASE SETUP
-# -----------------------------------------------------------
-# You need a "service account key" JSON file from Firebase.
-# Get it from: Firebase Console -> Project Settings ->
-# Service Accounts tab -> Generate new private key
-#
-# On Render.com, paste the FULL CONTENTS of that JSON file
-# into an environment variable called FIREBASE_CREDENTIALS_JSON
-# (Render dashboard -> Environment -> Add Environment Variable)
-# -----------------------------------------------------------
+FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com"}
 
-firebase_creds_raw = os.environ.get("FIREBASE_CREDENTIALS_JSON")
-local_key_file = "firebase-key.json"
-
-if firebase_creds_raw:
-    # Used on Render.com, where the key is set as an environment variable
-    cred_dict = json.loads(firebase_creds_raw)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-elif os.path.exists(local_key_file):
-    # Used for local testing on your laptop -- just place the
-    # downloaded JSON file in this same folder, named
-    # "firebase-key.json", no copy-pasting needed
-    cred = credentials.Certificate(local_key_file)
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print(f"Loaded Firebase credentials from local file: {local_key_file}")
-else:
-    # Neither method found -- server still starts, but lookups
-    # will fail with a clear error
-    db = None
-    print("WARNING: No Firebase credentials found. Either set")
-    print("FIREBASE_CREDENTIALS_JSON, or place a file named")
-    print(f"'{local_key_file}' in this folder. Firestore lookups will fail.")
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_REGEX = re.compile(r"(?:\+263|0)(7[0-8])\d{7}")
+SALARY_REGEX = re.compile(r"(usd|us\$|\$|zwl|salary|stipend|remuneration)\s*[:\-]?\s*\d", re.IGNORECASE)
+LOCATION_HINTS = re.compile(
+    r"\b(harare|bulawayo|gweru|mutare|masvingo|chitungwiza|kwekwe|kadoma|"
+    r"zvishavane|chinhoyi|bindura|victoria falls|location|based in|remote|"
+    r"hybrid|on-site)\b",
+    re.IGNORECASE,
+)
+COMPANY_NAME_HINTS = re.compile(
+    r"\b(pvt ltd|private limited|ltd|limited|inc|company|enterprises|group|"
+    r"holdings|solutions)\b",
+    re.IGNORECASE,
+)
+EXCESSIVE_CAPS_OR_EMOJI = re.compile(r"[A-Z]{6,}|[\U0001F300-\U0001FAFF]{3,}")
 
 
-# -----------------------------------------------------------
-# HEALTH CHECK -- visit this URL in a browser to confirm
-# the server is alive at all
-# -----------------------------------------------------------
+def _find_matches(phrases: List[str], lower_text: str) -> List[str]:
+    return [p for p in phrases if p in lower_text]
+
+
+def score_job_text(text: str) -> Tuple[int, List[str], int]:
+    """Returns (score, warnings, signal_count). signal_count is how many
+    concrete identifying details (email, phone, salary, location, company
+    name) were found — used to report an honest confidence level rather
+    than presenting a score based on a one-line ad the same way as a score
+    based on a full, detailed posting."""
+    score = 100
+    warnings: List[str] = []
+    signal_count = 0
+    lower = text.lower()
+
+    payment_hits = _find_matches(PAYMENT_SCAM_PHRASES, lower)
+    if payment_hits:
+        score -= 45
+        for phrase in payment_hits[:3]:
+            warnings.append(
+                f'Mentions "{phrase}" — never pay money or send EcoCash/mobile '
+                f"money to apply for or secure a job. Legitimate employers do not "
+                f"charge job seekers."
+            )
+
+    promise_hits = _find_matches(PROMISE_SCAM_PHRASES, lower)
+    if promise_hits:
+        score -= 20
+        warnings.append(
+            f'Uses an unrealistic promise ("{promise_hits[0]}"). Be skeptical of '
+            f"jobs that guarantee hiring with no interview or selection process."
+        )
+
+    urgency_hits = _find_matches(URGENCY_PHRASES, lower)
+    if urgency_hits:
+        score -= 8
+        warnings.append(
+            "Uses urgency language (e.g. 'hurry', 'limited slots'). Scammers "
+            "often pressure quick decisions to prevent you from checking the offer."
+        )
+
+    emails = EMAIL_REGEX.findall(text)
+    phones = PHONE_REGEX.findall(text)
+    vague_contact_hits = _find_matches(VAGUE_CONTACT_PHRASES, lower)
+
+    if emails:
+        signal_count += 1
+        domain_part = emails[0].split("@")[-1].lower()
+        if domain_part in FREE_EMAIL_DOMAINS:
+            score -= 10
+            warnings.append(
+                "Contact email uses a free webmail service rather than a company "
+                "domain — genuine employers usually use a company email address."
+            )
+    else:
+        score -= 12
+        warnings.append("No email address found — verify the company independently before applying.")
+
+    if phones:
+        signal_count += 1
+        if not emails:
+            score -= 10
+            warnings.append(
+                "Only a phone number is provided, with no email or company details. "
+                "Be cautious of phone-only or WhatsApp-only job ads."
+            )
+
+    if vague_contact_hits:
+        score -= 8
+        warnings.append("Asks you to apply only via WhatsApp/DM with no formal application process.")
+
+    if SALARY_REGEX.search(text):
+        signal_count += 1
+    else:
+        score -= 10
+        warnings.append("No clear salary or pay information mentioned.")
+
+    if LOCATION_HINTS.search(text):
+        signal_count += 1
+    else:
+        score -= 8
+        warnings.append("No clear location mentioned for this job.")
+
+    if COMPANY_NAME_HINTS.search(text):
+        signal_count += 1
+    else:
+        score -= 7
+        warnings.append("No identifiable company/business name found in this ad.")
+
+    if EXCESSIVE_CAPS_OR_EMOJI.search(text):
+        score -= 5
+        warnings.append("Ad uses excessive capital letters or emojis, common in spam-style postings.")
+
+    score = max(0, min(100, score))
+    return score, warnings, signal_count
+
+
+def _confidence_level(text: str, signal_count: int) -> str:
+    """Honest self-assessment of how much to trust this particular score.
+    A two-line ad with no email, phone, salary, or location gives us almost
+    nothing to judge — that should read as low confidence, not the same
+    polish as a fully detailed posting."""
+    word_count = len(text.split())
+    if word_count < 15 or signal_count == 0:
+        return "low"
+    if signal_count <= 2:
+        return "medium"
+    return "high"
+
+
+def _label_for_score(score: int) -> str:
+    if score >= 70:
+        return "Likely genuine"
+    if score >= 40:
+        return "Use caution"
+    return "High risk"
+
+
+# ---------- Endpoint ----------
+
+@app.post("/api/job-scan", response_model=JobScanResponse)
+def job_scan(payload: JobScanRequest):
+    raw_input = payload.input.strip()
+
+    if not URL_PATTERN.match(raw_input):
+        # Raw pasted text — no domain to check, just run the text rules.
+        score, warnings, signal_count = score_job_text(raw_input)
+        confidence = _confidence_level(raw_input, signal_count)
+        return JobScanResponse(
+            score=score, label=_label_for_score(score), warnings=warnings,
+            source_type="text", confidence=confidence,
+        )
+
+    # ---- URL path ----
+    fetch_result = fetch_page(raw_input)
+    if fetch_result is None:
+        return JobScanResponse(
+            score=0,
+            label="Could not verify",
+            warnings=[
+                "We couldn't access this link directly (it may be blocked or "
+                "require login, e.g. Facebook/WhatsApp). Please copy and paste "
+                "the full job ad text instead for an accurate scan."
+            ],
+            source_type="url",
+            fetch_failed=True,
+        )
+
+    soup, final_url, redirect_count = fetch_result
+    # Use the FINAL resolved URL's domain — important for shortened links
+    # (bit.ly, tinyurl, etc.) that redirect to the real destination.
+    domain = extract_domain(final_url)
+    detected_company = extract_company_name(soup)  # must run BEFORE stripping scripts
+    visible_text = extract_visible_text(soup)
+
+    # Base score from the text rules engine.
+    score, warnings, signal_count = score_job_text(visible_text)
+    confidence = _confidence_level(visible_text, signal_count)
+    if detected_company:
+        # Being able to identify who the page claims to represent is itself
+        # a meaningful signal, even before checking if that claim is true.
+        signal_count += 1
+        confidence = _confidence_level(visible_text, signal_count)
+
+    # Domain/company verification checks — these are strong signals, so they
+    # go to the front of the warnings list and carry meaningful penalties.
+    # Two independent detection paths feed into one combined brand-impersonation
+    # check, so a single match doesn't get penalized twice:
+    #   1. text-based: does the page's CLAIMED company name mismatch the domain?
+    #   2. structure-based: does the domain ITSELF contain a brand name it
+    #      shouldn't (catches pages with no extractable company name at all)?
+    brand_warnings = check_company_domain_mismatch(domain, detected_company) + check_brand_lookalike_domain(domain)
+    if brand_warnings:
+        score -= 30
+
+    ip_warnings = check_ip_as_domain(domain)
+    if ip_warnings:
+        score -= 25
+
+    tld_warnings = check_suspicious_tld(domain)
+    if tld_warnings:
+        score -= 10
+
+    redirect_warnings = check_redirect_chain(redirect_count)
+    if redirect_warnings:
+        score -= 10
+
+    age_warnings = check_domain_age(domain)
+    if age_warnings:
+        score -= 15 if "less than a month" in age_warnings[0] else 8
+
+    warnings = brand_warnings + ip_warnings + tld_warnings + redirect_warnings + age_warnings + warnings
+    score = max(0, min(100, score))
+
+    return JobScanResponse(
+        score=score,
+        label=_label_for_score(score),
+        warnings=warnings,
+        source_type="url",
+        domain=domain,
+        detected_company=detected_company,
+        confidence=confidence,
+    )
+
+
 @app.get("/")
 def health_check():
-    return {"status": "ZIMRA Duty Check server is running"}
-
-
-# -----------------------------------------------------------
-# DEBUG ENDPOINT -- view the most recent photo the camera sent
-# -----------------------------------------------------------
-# Visit this in a browser after triggering a scan, to see
-# exactly what the ESP32-CAM captured. Helps a lot when OCR
-# isn't reading anything -- you can SEE if the photo is blurry,
-# glared, too dark, or just not framed on the plate.
-# -----------------------------------------------------------
-from fastapi.responses import FileResponse
-import os
-
-@app.get("/api/last-photo")
-def get_last_photo():
-    if os.path.exists("last_photo.jpg"):
-        return FileResponse("last_photo.jpg", media_type="image/jpeg")
-    return {"error": "No photo received yet. Trigger a scan first."}
-
-
-# -----------------------------------------------------------
-# MAIN ENDPOINT -- the ESP32-CAM sends a PHOTO here
-# -----------------------------------------------------------
-# Expected request: POST /api/check
-# Body: raw JPEG photo bytes (this is what the ESP32 code sends)
-#
-# This endpoint reads the plate text out of the photo using
-# OCR.space, then looks that plate up in Firestore.
-#
-# Response: JSON, e.g.
-# {
-#   "plate": "ACP1234",
-#   "status": "PAID",
-#   "owner": "T. Moyo",
-#   "amountPaid": "450.00",
-#   "clearanceStatus": "CLEARED",
-#   "officerName": "Tendai",
-#   "officerSurname": "Moyo",
-#   "forceNumber": "ZRP4521"
-# }
-#
-# "status" can be one of THREE things:
-#   "PAID"      -- plate was read and found, duty is paid
-#   "NOTPAID"   -- plate was read, but not found, or found
-#                  and marked unpaid
-#   "NOVEHICLE" -- OCR found NO readable plate text at all in
-#                  the photo. This usually means there genuinely
-#                  was no vehicle in frame (just background,
-#                  ground, etc), or the photo was too blurry/
-#                  dark to read anything at all. The ESP32 code
-#                  shows a distinct "no vehicle detected" screen
-#                  for this case, instead of treating it like an
-#                  actual unpaid vehicle.
-#
-# "clearanceStatus" mirrors the same field from the admin
-# register ("CLEARED" / "NOTCLEARED"), and officerName /
-# officerSurname / forceNumber identify whoever last cleared
-# the vehicle, if anyone has. The clearance photo itself is
-# deliberately left out of this response -- it's a multi-
-# hundred-KB base64 string, which is a lot to push to an
-# ESP32-CAM that has nowhere to display it anyway.
-# -----------------------------------------------------------
-def build_response(plate_id: str, data: dict | None, no_vehicle: bool = False) -> dict:
-    """Builds the JSON shape sent back to the ESP32-CAM.
-
-    no_vehicle=True means OCR found no plate text at all --
-    this is reported as its own status, separate from a real
-    "not paid" result, since they mean very different things.
-    """
-    if no_vehicle:
-        return {
-            "plate": "",
-            "status": "NOVEHICLE",
-            "owner": "",
-            "amountPaid": "",
-            "clearanceStatus": "",
-            "officerName": "",
-            "officerSurname": "",
-            "forceNumber": "",
-        }
-    if data is None:
-        return {
-            "plate": plate_id,
-            "status": "NOTPAID",
-            "owner": "",
-            "amountPaid": "",
-            "clearanceStatus": "NOTCLEARED",
-            "officerName": "",
-            "officerSurname": "",
-            "forceNumber": "",
-        }
-    return {
-        "plate": data.get("plate", plate_id),
-        "status": data.get("status", "NOTPAID"),
-        "owner": data.get("owner", ""),
-        "amountPaid": data.get("amountPaid", ""),
-        "clearanceStatus": data.get("clearanceStatus", "NOTCLEARED"),
-        "officerName": data.get("officerName", ""),
-        "officerSurname": data.get("officerSurname", ""),
-        "forceNumber": data.get("forceNumber", ""),
-    }
-
-
-@app.post("/api/check")
-async def check_duty(request: Request):
-    if db is None:
-        return build_response("", None)
-
-    image_bytes = await request.body()
-
-    if not image_bytes:
-        # No photo data at all was sent -- nothing to check
-        return build_response("", None, no_vehicle=True)
-
-    # DEBUG: save the most recent photo received, so you can
-    # open it and SEE exactly what the camera captured. This
-    # overwrites the same file each time -- it's just for
-    # troubleshooting, not permanent storage.
-    try:
-        with open("last_photo.jpg", "wb") as f:
-            f.write(image_bytes)
-        print(f"Saved debug photo: last_photo.jpg ({len(image_bytes)} bytes)")
-    except Exception as e:
-        print(f"Could not save debug photo: {e}")
-
-    # Step 1: read the plate text out of the photo
-    plate_id = extract_plate_text(image_bytes)
-    print(f"OCR read plate as: '{plate_id}'")
-
-    if not plate_id:
-        # OCR found no readable plate text at all -- most likely
-        # no vehicle was actually in frame, or the photo was too
-        # blurry/dark. Report this as its own distinct status.
-        return build_response("", None, no_vehicle=True)
-
-    # Step 2: look that plate up in Firestore, with an O/Q
-    # letter-swap retry if the first guess isn't registered
-    resolved_plate_id, data = lookup_vehicle(plate_id)
-    return build_response(resolved_plate_id, data)
-
-
-# -----------------------------------------------------------
-# ALTERNATE ENDPOINT -- for testing with a plate number
-# typed directly into a browser URL, without needing the
-# ESP32-CAM or Postman
-# -----------------------------------------------------------
-@app.get("/api/check-test/{plate}")
-async def check_duty_test(plate: str):
-    if db is None:
-        return build_response(plate, None)
-
-    plate_id = plate.strip().upper().replace(" ", "")
-    resolved_plate_id, data = lookup_vehicle(plate_id)
-    return build_response(resolved_plate_id, data)
+    return {"status": "ok", "service": "Fambai CV Job Scan"}
